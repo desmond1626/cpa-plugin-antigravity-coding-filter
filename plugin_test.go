@@ -40,6 +40,9 @@ func TestHandlePluginCallRegisterDeclaresBothFilterModes(t *testing.T) {
 	if !hasConfigField(fields, "use_default_keywords", "boolean") {
 		t.Fatalf("ConfigFields = %#v, want boolean use_default_keywords", fields)
 	}
+	if !hasConfigField(fields, "include_instructions", "boolean") {
+		t.Fatalf("ConfigFields = %#v, want boolean include_instructions", fields)
+	}
 	if !hasConfigField(fields, "custom_mappings", "object") {
 		t.Fatalf("ConfigFields = %#v, want object custom_mappings", fields)
 	}
@@ -56,6 +59,8 @@ mode: rewrite
 custom_mappings:
   Cursor: Antigravity
   Windsurf: Antigravity
+  Hermes Agent: Antigravity
+include_instructions: true
 `)))
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; body=%s", code, raw)
@@ -63,6 +68,9 @@ custom_mappings:
 
 	if got, rewritten := rewriteRequestBody([]byte(`{"system":"You are Codex."}`)); rewritten {
 		t.Fatalf("Codex rewritten after disabling defaults; body=%s", got)
+	}
+	if got, rewritten := rewriteRequestBodyWithFormat([]byte(`{"instructions":"You are Hermes Agent."}`), activeFilterConfig(), openAIResponsesFormat); !rewritten || !strings.Contains(string(got), "Antigravity") {
+		t.Fatalf("instructions body = %s, rewritten=%v, want enabled instructions rewrite", got, rewritten)
 	}
 	got, rewritten := rewriteRequestBody([]byte(`{"system":"route this Cursor session"}`))
 	if !rewritten {
@@ -172,6 +180,72 @@ func TestHandlePluginCallRequestInterceptBeforeRewritesCodingSignals(t *testing.
 	}
 }
 
+func TestHandlePluginCallRequestInterceptBeforeRewritesInstructionsForResponses(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(filterConfig{
+		Mode:                filterModeRewrite,
+		IncludeInstructions: true,
+		CustomMappings: []rewriteMapping{
+			{Match: "Hermes Agent", Replacement: "an intelligent AI coding assistant"},
+		},
+	})
+
+	request := requestInterceptRequestJSONWithFormat(t, `{"instructions":"You are Hermes Agent.","metadata":{"instructions":"Keep Hermes Agent here too."}}`, "openai-response")
+	raw, code := handlePluginCall("request.intercept_before", request)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; body=%s", code, raw)
+	}
+
+	var envelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Body string `json:"Body"`
+		} `json:"result"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	if !envelope.OK {
+		t.Fatalf("response = %s, want success", raw)
+	}
+	body, err := base64.StdEncoding.DecodeString(envelope.Result.Body)
+	if err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if !strings.Contains(string(body), `"instructions":"You are an intelligent AI coding assistant."`) {
+		t.Fatalf("body = %s, instructions was not rewritten", body)
+	}
+	if !strings.Contains(string(body), `"instructions":"Keep an intelligent AI coding assistant here too."`) {
+		t.Fatalf("body = %s, nested instructions was not rewritten", body)
+	}
+}
+
+func TestHandlePluginCallRequestInterceptBeforeDoesNotRewriteInstructionsForChatCompletions(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+	applyFilterConfig(filterConfig{
+		Mode:                filterModeRewrite,
+		IncludeInstructions: true,
+		CustomMappings: []rewriteMapping{
+			{Match: "Hermes Agent", Replacement: "an intelligent AI coding assistant"},
+		},
+	})
+
+	request := requestInterceptRequestJSONWithFormat(t, `{"instructions":"You are Hermes Agent."}`, "openai")
+	raw, code := handlePluginCall("request.intercept_before", request)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0; body=%s", code, raw)
+	}
+
+	var envelope struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Body string `json:"Body"`
+		} `json:"result"`
+	}
+	mustUnmarshalJSON(t, raw, &envelope)
+	if !envelope.OK || envelope.Result.Body != "" {
+		t.Fatalf("response = %s, want unchanged chat-completions request", raw)
+	}
+}
+
 func TestHandlePluginCallRequestInterceptBeforeDoesNotRewriteInDefaultBlockMode(t *testing.T) {
 	defer restoreDefaultFilterConfig(t)
 	applyFilterConfig(defaultFilterConfig())
@@ -221,6 +295,52 @@ func TestHandlePluginCallModelRouteBlocksMatchedRequestsByDefault(t *testing.T) 
 	}
 	if !strings.Contains(envelope.Result.Reason, "system.keyword:qoder") {
 		t.Fatalf("Reason = %q, want qoder keyword detail", envelope.Result.Reason)
+	}
+}
+
+func TestHandlePluginCallModelRouteFiltersInstructionsOnlyForResponses(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+
+	tests := []struct {
+		name                string
+		format              string
+		includeInstructions bool
+		wantHandled         bool
+	}{
+		{name: "responses enabled", format: openAIResponsesFormat, includeInstructions: true, wantHandled: true},
+		{name: "responses disabled", format: openAIResponsesFormat, wantHandled: false},
+		{name: "chat completions", format: "openai", includeInstructions: true, wantHandled: false},
+		{name: "missing format", format: "", includeInstructions: true, wantHandled: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applyFilterConfig(filterConfig{
+				Mode:                filterModeBlock,
+				IncludeInstructions: tt.includeInstructions,
+				CustomMappings: []rewriteMapping{
+					{Match: "Hermes Agent", Replacement: "Antigravity"},
+				},
+			})
+			raw, code := handlePluginCall("model.route", modelRouteRequestJSONWithFormat(t, `{"instructions":"You are Hermes Agent."}`, tt.format))
+			if code != 0 {
+				t.Fatalf("code = %d, want 0; body=%s", code, raw)
+			}
+			var envelope struct {
+				OK     bool `json:"ok"`
+				Result struct {
+					Handled bool   `json:"Handled"`
+					Reason  string `json:"Reason"`
+				} `json:"result"`
+			}
+			mustUnmarshalJSON(t, raw, &envelope)
+			if !envelope.OK || envelope.Result.Handled != tt.wantHandled {
+				t.Fatalf("response = %s, want handled=%v", raw, tt.wantHandled)
+			}
+			if tt.wantHandled && !strings.Contains(envelope.Result.Reason, "instructions.keyword:hermes agent") {
+				t.Fatalf("Reason = %q, want instructions keyword detail", envelope.Result.Reason)
+			}
+		})
 	}
 }
 
@@ -374,9 +494,13 @@ func TestHandlePluginCallUnknownMethodReturnsErrorEnvelope(t *testing.T) {
 }
 
 func requestInterceptRequestJSON(t *testing.T, body string) []byte {
+	return requestInterceptRequestJSONWithFormat(t, body, "openai")
+}
+
+func requestInterceptRequestJSONWithFormat(t *testing.T, body, sourceFormat string) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
-		"SourceFormat":   "openai",
+		"SourceFormat":   sourceFormat,
 		"ToFormat":       "",
 		"Model":          "antigravity/test",
 		"RequestedModel": "antigravity/test",
@@ -389,9 +513,13 @@ func requestInterceptRequestJSON(t *testing.T, body string) []byte {
 }
 
 func modelRouteRequestJSON(t *testing.T, body string) []byte {
+	return modelRouteRequestJSONWithFormat(t, body, "openai")
+}
+
+func modelRouteRequestJSONWithFormat(t *testing.T, body, sourceFormat string) []byte {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
-		"SourceFormat":   "openai",
+		"SourceFormat":   sourceFormat,
 		"RequestedModel": "antigravity/test",
 		"Body":           []byte(body),
 	})

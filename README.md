@@ -4,12 +4,18 @@ CLIProxyAPI v7 dynamic plugin for blocking or rewriting non-Antigravity coding s
 
 ## Filter Modes
 
-The plugin detects configured coding-client names when they appear inside JSON fields named `system`. Choose how matches are handled with `mode`:
+The plugin detects configured coding-client names in JSON `system` fields and,
+when enabled, fields named `instructions` in Responses API requests. Choose how
+matches are handled with `mode`:
 
 - `block` (default): reject the entire request with HTTP `403 Forbidden` and a `blocked_by_antigravity_coding_filter` error.
 - `rewrite`: replace matched names with `Antigravity` and forward the request.
 
-Matching is case-insensitive and only scans `system`. Mentions in user prompts, `messages`, or other fields do not trigger the filter.
+Matching is case-insensitive. `system` fields are scanned recursively for
+backward compatibility; when enabled, `instructions` fields are scanned
+recursively as well. Mentions in user prompts, `messages`, metadata, tool
+parameters, or other fields do not trigger the filter unless the field itself
+is named `instructions` and the request is a Responses request.
 
 HTTP 403 propagation requires CLIProxyAPI v7.2.93 or newer. Earlier hosts do not understand the plugin RPC `http_status` error field.
 
@@ -39,6 +45,7 @@ plugins:
       priority: 1
       mode: rewrite
       use_default_keywords: false
+      include_instructions: true
       custom_mappings:
         Cursor: Antigravity
         Windsurf: Antigravity
@@ -72,8 +79,16 @@ plugins:
       priority: 1
       mode: block
       use_default_keywords: true
+      include_instructions: false
       custom_mappings: {}
 ```
+
+`include_instructions` controls whether the plugin also scans and rewrites JSON
+fields named `instructions` in Responses API requests. It defaults to `false`,
+so existing configurations continue to scan only `system`. Set it to `true` for
+clients such as Hermes whose identity prompt is sent in `instructions`. The
+field is only considered when the request format is the OpenAI Responses
+format (`openai-response`).
 
 CLIProxyAPI searches `plugins/<GOOS>/<GOARCH>-<variant>`, then `plugins/<GOOS>/<GOARCH>`, then `plugins`.
 

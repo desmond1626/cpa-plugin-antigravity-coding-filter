@@ -54,9 +54,10 @@ import (
 const abiVersion = 1
 
 const (
-	pluginName       = "antigravity-coding-filter"
-	pluginVersion    = "0.2.1"
-	pluginRepository = "https://github.com/jellyfish-p/cpa-plugin-antigravity-coding-filter"
+	pluginName            = "antigravity-coding-filter"
+	pluginVersion         = "0.3.0"
+	pluginRepository      = "https://github.com/desmond1626/cpa-plugin-antigravity-coding-filter"
+	openAIResponsesFormat = "openai-response"
 )
 
 func main() {}
@@ -208,9 +209,14 @@ func configFields() []pluginapi.ConfigField {
 			Description: "Enable the built-in coding software and agent keyword preset.",
 		},
 		{
+			Name:        "include_instructions",
+			Type:        pluginapi.ConfigFieldTypeBoolean,
+			Description: "Also scan and rewrite JSON fields named instructions for Responses API requests. The default is false; system fields are always scanned.",
+		},
+		{
 			Name:        "custom_mappings",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Additional case-insensitive system-field mappings. Keys are blocked in block mode and rewritten to their values in rewrite mode.",
+			Description: "Additional case-insensitive mappings for enabled system/instructions fields. Keys are blocked in block mode and rewritten to their values in rewrite mode.",
 		},
 	}
 }
@@ -225,7 +231,7 @@ func handleModelRoute(request []byte) []byte {
 	if cfg.Mode != filterModeBlock {
 		return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
-	decision := classifyRequestWithConfig(req.Body, cfg)
+	decision := classifyRequestWithFormat(req.Body, cfg, req.SourceFormat)
 	if !decision.Blocked {
 		return mustEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
@@ -275,7 +281,7 @@ func handleRequestInterceptBefore(request []byte) []byte {
 		return mustEnvelope(pluginapi.RequestInterceptResponse{})
 	}
 
-	body, rewritten := rewriteRequestBodyWithConfig(req.Body, cfg)
+	body, rewritten := rewriteRequestBodyWithFormat(req.Body, cfg, req.SourceFormat)
 	if !rewritten {
 		return mustEnvelope(pluginapi.RequestInterceptResponse{})
 	}
@@ -388,9 +394,10 @@ type rewriteMapping struct {
 }
 
 type filterConfig struct {
-	Mode               filterMode
-	UseDefaultKeywords bool
-	CustomMappings     []rewriteMapping
+	Mode                filterMode
+	UseDefaultKeywords  bool
+	IncludeInstructions bool
+	CustomMappings      []rewriteMapping
 }
 
 var (
@@ -407,9 +414,10 @@ func applyFilterConfig(cfg filterConfig) {
 	defer filterConfigMu.Unlock()
 
 	currentFilterConfig = filterConfig{
-		Mode:               cfg.Mode,
-		UseDefaultKeywords: cfg.UseDefaultKeywords,
-		CustomMappings:     append([]rewriteMapping(nil), normalizeMappings(cfg.CustomMappings)...),
+		Mode:                cfg.Mode,
+		UseDefaultKeywords:  cfg.UseDefaultKeywords,
+		IncludeInstructions: cfg.IncludeInstructions,
+		CustomMappings:      append([]rewriteMapping(nil), normalizeMappings(cfg.CustomMappings)...),
 	}
 }
 
@@ -418,9 +426,10 @@ func activeFilterConfig() filterConfig {
 	defer filterConfigMu.RUnlock()
 
 	return filterConfig{
-		Mode:               currentFilterConfig.Mode,
-		UseDefaultKeywords: currentFilterConfig.UseDefaultKeywords,
-		CustomMappings:     append([]rewriteMapping(nil), currentFilterConfig.CustomMappings...),
+		Mode:                currentFilterConfig.Mode,
+		UseDefaultKeywords:  currentFilterConfig.UseDefaultKeywords,
+		IncludeInstructions: currentFilterConfig.IncludeInstructions,
+		CustomMappings:      append([]rewriteMapping(nil), currentFilterConfig.CustomMappings...),
 	}
 }
 
@@ -462,6 +471,13 @@ func parseFilterConfigYAML(raw []byte) (filterConfig, error) {
 			return filterConfig{}, fmt.Errorf("use_default_keywords must be a boolean")
 		}
 		cfg.UseDefaultKeywords = boolValue
+	}
+	if value, exists := values["include_instructions"]; exists {
+		boolValue, ok := value.(bool)
+		if !ok {
+			return filterConfig{}, fmt.Errorf("include_instructions must be a boolean")
+		}
+		cfg.IncludeInstructions = boolValue
 	}
 	if value, exists := values["custom_mappings"]; exists {
 		mappings, err := parseCustomMappings(value)
@@ -575,21 +591,34 @@ func classifyRequest(body []byte) filterDecision {
 }
 
 func classifyRequestWithConfig(body []byte, cfg filterConfig) filterDecision {
+	return classifyRequestWithFormat(body, cfg, "")
+}
+
+func classifyRequestWithFormat(body []byte, cfg filterConfig, format string) filterDecision {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
 		return filterDecision{}
 	}
 
 	mappings := effectiveMappings(cfg)
+	includeInstructions := instructionsEnabled(cfg, format)
 	var decision filterDecision
 	walkJSON(root, func(path []string, value any) bool {
-		if len(path) == 0 || path[len(path)-1] != "system" {
+		field := ""
+		if len(path) > 0 {
+			field = filterFieldName(path[len(path)-1], includeInstructions)
+		}
+		if field == "" {
 			return true
 		}
 		text := strings.ToLower(collectText(value))
 		for _, mapping := range mappings {
 			if strings.Contains(text, mapping.Match) {
-				decision = filterDecision{Blocked: true, Signal: "system.keyword", Detail: mapping.Match}
+				decision = filterDecision{
+					Blocked: true,
+					Signal:  field + ".keyword",
+					Detail:  mapping.Match,
+				}
 				return false
 			}
 		}
@@ -598,16 +627,31 @@ func classifyRequestWithConfig(body []byte, cfg filterConfig) filterDecision {
 	return decision
 }
 
+func instructionsEnabled(cfg filterConfig, format string) bool {
+	return cfg.IncludeInstructions && format == openAIResponsesFormat
+}
+
+func filterFieldName(field string, includeInstructions bool) string {
+	if field == "system" || (includeInstructions && field == "instructions") {
+		return field
+	}
+	return ""
+}
+
 func rewriteRequestBody(body []byte) ([]byte, bool) {
 	return rewriteRequestBodyWithConfig(body, activeFilterConfig())
 }
 
 func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) {
+	return rewriteRequestBodyWithFormat(body, cfg, "")
+}
+
+func rewriteRequestBodyWithFormat(body []byte, cfg filterConfig, format string) ([]byte, bool) {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil, false
 	}
-	rewritten, changed := rewriteSystemFields(root, effectiveMappings(cfg))
+	rewritten, changed := rewriteFilterFields(root, effectiveMappings(cfg), instructionsEnabled(cfg, format))
 	if !changed {
 		return nil, false
 	}
@@ -618,12 +662,12 @@ func rewriteRequestBodyWithConfig(body []byte, cfg filterConfig) ([]byte, bool) 
 	return raw, true
 }
 
-func rewriteSystemFields(value any, mappings []rewriteMapping) (any, bool) {
+func rewriteFilterFields(value any, mappings []rewriteMapping, includeInstructions bool) (any, bool) {
 	switch typed := value.(type) {
 	case map[string]any:
 		changed := false
 		for key, child := range typed {
-			if key == "system" {
+			if filterFieldName(key, includeInstructions) != "" {
 				next, childChanged := rewriteSystemValue(child, mappings)
 				if childChanged {
 					typed[key] = next
@@ -631,7 +675,7 @@ func rewriteSystemFields(value any, mappings []rewriteMapping) (any, bool) {
 				}
 				continue
 			}
-			next, childChanged := rewriteSystemFields(child, mappings)
+			next, childChanged := rewriteFilterFields(child, mappings, includeInstructions)
 			if childChanged {
 				typed[key] = next
 				changed = true
@@ -641,7 +685,7 @@ func rewriteSystemFields(value any, mappings []rewriteMapping) (any, bool) {
 	case []any:
 		changed := false
 		for i, child := range typed {
-			next, childChanged := rewriteSystemFields(child, mappings)
+			next, childChanged := rewriteFilterFields(child, mappings, includeInstructions)
 			if childChanged {
 				typed[i] = next
 				changed = true

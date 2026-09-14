@@ -42,6 +42,78 @@ func TestRewriteRequestReplacesDefaultSystemKeywords(t *testing.T) {
 	}
 }
 
+func TestRewriteRequestRewritesInstructionsOnlyWhenEnabled(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+
+	body := []byte(`{"instructions":"You are Hermes Agent, created by Nous Research.","system":"You are Codex."}`)
+
+	applyFilterConfig(filterConfig{Mode: filterModeRewrite, UseDefaultKeywords: true})
+	got, rewritten := rewriteRequestBody(body)
+	if !rewritten || strings.Contains(string(got), `"instructions":"You are Antigravity`) {
+		t.Fatalf("body = %s, instructions should remain unchanged", got)
+	}
+
+	applyFilterConfig(filterConfig{
+		Mode:                filterModeRewrite,
+		UseDefaultKeywords:  true,
+		IncludeInstructions: true,
+	})
+	got, rewritten = rewriteRequestBodyWithFormat(body, activeFilterConfig(), openAIResponsesFormat)
+	if !rewritten {
+		t.Fatal("rewritten = false, want true when instructions scanning is enabled")
+	}
+	if !strings.Contains(string(got), "You are Antigravity, created by Nous Research.") {
+		t.Fatalf("body = %s, want Hermes Agent rewritten in instructions", got)
+	}
+	if !strings.Contains(string(got), `"system":"You are Antigravity."`) {
+		t.Fatalf("body = %s, want system rewritten as well", got)
+	}
+}
+
+func TestInstructionsMappingCanBeConfiguredWithoutDefaultKeywords(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+
+	applyFilterConfig(filterConfig{
+		Mode:                filterModeRewrite,
+		IncludeInstructions: true,
+		CustomMappings: []rewriteMapping{
+			{Match: "Hermes Agent", Replacement: "an intelligent AI coding assistant"},
+		},
+	})
+
+	got, rewritten := rewriteRequestBodyWithFormat([]byte(`{"instructions":"You are Hermes Agent."}`), activeFilterConfig(), openAIResponsesFormat)
+	if !rewritten || !strings.Contains(string(got), "an intelligent AI coding assistant") {
+		t.Fatalf("body = %s, rewritten=%v, want custom instructions mapping", got, rewritten)
+	}
+	if got, rewritten := rewriteRequestBodyWithFormat([]byte(`{"instructions":"You are Codex."}`), activeFilterConfig(), openAIResponsesFormat); rewritten {
+		t.Fatalf("body = %s, rewritten=%v, default Codex mapping should be disabled", got, rewritten)
+	}
+}
+
+func TestInstructionsMatchesNestedFieldsWhenEnabled(t *testing.T) {
+	defer restoreDefaultFilterConfig(t)
+
+	applyFilterConfig(filterConfig{
+		Mode:                filterModeRewrite,
+		IncludeInstructions: true,
+		CustomMappings: []rewriteMapping{
+			{Match: "Hermes Agent", Replacement: "an intelligent AI coding assistant"},
+		},
+	})
+
+	body := []byte(`{"instructions":"You are Hermes Agent.","metadata":{"instructions":"Keep Hermes Agent here too."},"tools":[{"parameters":{"instructions":"Keep Hermes Agent here as well."}}]}`)
+	got, rewritten := rewriteRequestBodyWithFormat(body, activeFilterConfig(), openAIResponsesFormat)
+	if !rewritten {
+		t.Fatal("rewritten = false, want instructions fields rewritten")
+	}
+	text := string(got)
+	if !strings.Contains(text, `"instructions":"You are an intelligent AI coding assistant."`) ||
+		!strings.Contains(text, `"instructions":"Keep an intelligent AI coding assistant here too."`) ||
+		!strings.Contains(text, `"instructions":"Keep an intelligent AI coding assistant here as well."`) {
+		t.Fatalf("body = %s, all instructions fields should be rewritten", got)
+	}
+}
+
 func TestBuiltInKeywordPresetCoversMainstreamCodingToolsAndAgents(t *testing.T) {
 	defer restoreDefaultFilterConfig(t)
 	applyFilterConfig(defaultFilterConfig())
