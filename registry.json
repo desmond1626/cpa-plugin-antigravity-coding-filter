@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "antigravity-coding-filter",
+      "name": "Antigravity Coding Filter",
+      "description": "Rewrites coding-agent identity signals in CPA requests.",
+      "author": "desmond1626",
+      "repository": "https://github.com/desmond1626/cpa-plugin-antigravity-coding-filter",
+      "homepage": "https://github.com/desmond1626/cpa-plugin-antigravity-coding-filter",
+      "license": "MIT",
+      "tags": [
+        "Interceptor",
+        "Responses"
+      ]
+    }
+  ]
+}
